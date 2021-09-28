@@ -1,0 +1,341 @@
+diff --git a/Makefile b/Makefile
+index 1fa367e..6198f85 100644
+--- a/Makefile
++++ b/Makefile
+@@ -175,6 +175,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_alarmtest\
+ 
+ 
+ 
+@@ -288,6 +289,7 @@ qemu-gdb: $K/kernel .gdbinit fs.img
+ 	@echo "*** Now run 'gdb' in another window." 1>&2
+ 	$(QEMU) $(QEMUOPTS) -S $(QEMUGDB)
+ 
++
+ ifeq ($(LAB),net)
+ # try to generate a unique port for the echo server
+ SERVERPORT = $(shell expr `id -u` % 5000 + 25099)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 4b9bbc0..137c786 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -80,6 +80,7 @@ int             pipewrite(struct pipe*, uint64, int);
+ void            printf(char*, ...);
+ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
++void            backtrace(void);
+ 
+ // proc.c
+ int             cpuid(void);
+diff --git a/kernel/printf.c b/kernel/printf.c
+index e1347de..b6011cf 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -132,3 +132,16 @@ printfinit(void)
+   initlock(&pr.lock, "pr");
+   pr.locking = 1;
+ }
++
++
++
++void backtrace(void){
++  uint64 fp = r_fp();
++  uint64 stack_top = PGROUNDUP(fp);
++  
++  printf("backtrace:\n");
++  while(fp < stack_top){
++    printf("%p\n", *(uint64*)(fp-8)); // return address
++    fp = *(uint64*)(fp-16);
++  }
++}
+diff --git a/kernel/proc.c b/kernel/proc.c
+index dab1e1d..d14bd71 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -127,6 +127,16 @@ found:
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
++  p->tick_num = 0;
++  p->per_tick_num = -1;
++  p->handler_adr = 0;
++  p->in_handler = 0;
++
++  if((p->handler_frame = (struct handler_frame *)kalloc()) == 0){
++    release(&p->lock);
++    return 0;
++  }
++
+   return p;
+ }
+ 
+@@ -150,6 +160,16 @@ freeproc(struct proc *p)
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
++
++  // p->tick_num = 0;
++  // p->per_tick_num = 0;
++  // p->handler_adr = 0;
++  // p->in_handler = 0;
++
++  if(p->handler_frame){
++    kfree((void*)p->handler_frame);
++  }
++  p->handler_frame = 0;
+ }
+ 
+ // Create a user page table for a given process,
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..e282a65 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -80,6 +80,41 @@ struct trapframe {
+   /* 280 */ uint64 t6;
+ };
+ 
++struct handler_frame {
++  /*  0 */ uint64 epc;           
++  /*  8 */ uint64 ra;
++  /* 16 */ uint64 sp;
++  /* 24 */ uint64 gp;
++  /* 32 */ uint64 tp;
++  /* 40 */ uint64 t0;
++  /* 48 */ uint64 t1;
++  /* 56 */ uint64 t2;
++  /* 64 */ uint64 s0;
++  /* 72 */ uint64 s1;
++  /* 80 */ uint64 a0;
++  /* 88 */ uint64 a1;
++  /* 96 */ uint64 a2;
++  /* 104 */ uint64 a3;
++  /* 112 */ uint64 a4;
++  /* 120 */ uint64 a5;
++  /* 128 */ uint64 a6;
++  /* 136 */ uint64 a7;
++  /* 144 */ uint64 s2;
++  /* 152 */ uint64 s3;
++  /* 160 */ uint64 s4;
++  /* 168 */ uint64 s5;
++  /* 176 */ uint64 s6;
++  /* 184 */ uint64 s7;
++  /* 192 */ uint64 s8;
++  /* 200 */ uint64 s9;
++  /* 208 */ uint64 s10;
++  /* 216 */ uint64 s11;
++  /* 224 */ uint64 t3;
++  /* 232 */ uint64 t4;
++  /* 240 */ uint64 t5;
++  /* 248 */ uint64 t6;
++};
++
+ enum procstate { UNUSED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
+ // Per-process state
+@@ -94,6 +129,12 @@ struct proc {
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
+ 
++  int tick_num;
++  int per_tick_num;
++  int in_handler;
++  uint64 handler_adr;
++  struct handler_frame* handler_frame;
++
+   // these are private to the process, so p->lock need not be held.
+   uint64 kstack;               // Virtual address of kernel stack
+   uint64 sz;                   // Size of process memory (bytes)
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..2bea536 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -287,6 +287,15 @@ r_sp()
+   return x;
+ }
+ 
++// read and write the  frame pointer
++static inline uint64
++r_fp()
++{
++  uint64 x;
++  asm volatile("mv %0, s0" : "=r" (x) );
++  return x;
++}
++
+ // read and write tp, the thread pointer, which holds
+ // this core's hartid (core number), the index into cpus[].
+ static inline uint64
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..24bfccd 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_sigalarm(void);
++extern uint64 sys_sigreturn(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +129,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sigalarm] sys_sigalarm,
++[SYS_sigreturn] sys_sigreturn,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..67ca3a4 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sigalarm 22
++#define SYS_sigreturn 23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..4b636a0 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -70,6 +70,8 @@ sys_sleep(void)
+     sleep(&ticks, &tickslock);
+   }
+   release(&tickslock);
++
++  backtrace();
+   return 0;
+ }
+ 
+@@ -95,3 +97,42 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++
++uint64 sys_sigalarm(void){
++  int per_tick_num;
++  uint64 handler_adr;
++
++  if(argint(0, &per_tick_num) < 0){
++    return -1;
++  }
++  if(argaddr(1, &handler_adr) < 0){
++    return -1;
++  }
++  
++  struct proc* p = myproc();
++  p->per_tick_num = per_tick_num;
++  p->handler_adr = handler_adr;
++  p->in_handler = 0;
++
++  return 0;
++
++}
++
++uint64 sys_sigreturn(void){
++  struct proc* p = myproc();
++  p->trapframe->epc = p->handler_frame->epc;
++
++  uint64 start = (uint64)p->handler_frame + 8, end = start + 256,
++         tf = (uint64)p->trapframe + 40;
++  while(start < end){
++    *(uint64*)tf = *(uint64*)start;
++    tf += 8;
++    start += 8;
++  }
++  p->in_handler = 0;
++  
++  // printf("return\n");
++  // printf("ra: %p\n", p->trapframe->ra);
++  return 0;
++}
+\ No newline at end of file
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..9827cc2 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -77,8 +77,34 @@ usertrap(void)
+     exit(-1);
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2)
++  if(which_dev == 2){
++    p->tick_num++;
++    // printf("tick: %d\n", p->tick_num);
++    if(p->tick_num == p->per_tick_num){
++        if(!p->in_handler){
++          
++          p->handler_frame->epc = p->trapframe->epc;
++          // printf("ra: %p\n", p->trapframe->ra);
++
++          uint64 start = (uint64)p->handler_frame + 8, end = start + 256,
++                 tf = (uint64)p->trapframe + 40;
++          // printf("store!\n");
++          while(start < end){
++            *(uint64*)start = *(uint64*)tf;
++            start += 8;
++            tf += 8;
++          }
++          // printf("ticks!\n");
++          // printf("ra: %p\n", p->handler_frame->ra);
++          p->trapframe->epc = p->handler_adr;
++          p->in_handler = 1;
++        }       
++        p->tick_num = 0;
++    }
++
+     yield();
++  }
++    
+ 
+   usertrapret();
+ }
+diff --git a/user/call.c b/user/call.c
+index f725dcb..8896b76 100644
+--- a/user/call.c
++++ b/user/call.c
+@@ -12,6 +12,11 @@ int f(int x) {
+ }
+ 
+ void main(void) {
+-  printf("%d %d\n", f(8)+1, 13);
++  // printf("%d %d\n", f(8)+1, 13);
++
++  // // unsigned int i = 0x00646c72;
++	// // printf("H%x Wo%s", 57616, &i);
++  
++  printf("x=%d y=%d", 3);
+   exit(0);
+ }
+diff --git a/user/user.h b/user/user.h
+index b71ecda..675a192 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,9 @@ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+ 
++int sigalarm(int ticks, void (*handler)());
++int sigreturn(void);
++
+ // ulib.c
+ int stat(const char*, struct stat*);
+ char* strcpy(char*, const char*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..3c258dc 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("sigalarm");
++entry("sigreturn");
+\ No newline at end of file
