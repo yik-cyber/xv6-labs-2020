@@ -1,0 +1,223 @@
+diff --git a/answers-thread.txt b/answers-thread.txt
+new file mode 100644
+index 0000000..6bad521
+--- /dev/null
++++ b/answers-thread.txt
+@@ -0,0 +1 @@
++subscribe to Diana, and never get hungry
+\ No newline at end of file
+diff --git a/notxv6/barrier.c b/notxv6/barrier.c
+index 12793e8..842b98c 100644
+--- a/notxv6/barrier.c
++++ b/notxv6/barrier.c
+@@ -10,6 +10,7 @@ static int round = 0;
+ struct barrier {
+   pthread_mutex_t barrier_mutex;
+   pthread_cond_t barrier_cond;
++
+   int nthread;      // Number of threads that have reached this round of the barrier
+   int round;     // Barrier round
+ } bstate;
+@@ -30,7 +31,18 @@ barrier()
+   // Block until all threads have called barrier() and
+   // then increment bstate.round.
+   //
+-  
++
++  pthread_mutex_lock(&bstate.barrier_mutex);
++  // ++bstate.nthread;
++  if(++bstate.nthread == nthread){
++    ++bstate.round;
++    bstate.nthread = 0;
++    pthread_cond_broadcast(&bstate.barrier_cond);
++  }
++  else{
++    pthread_cond_wait(&bstate.barrier_cond, &bstate.barrier_mutex);
++  }
++  pthread_mutex_unlock(&bstate.barrier_mutex);
+ }
+ 
+ static void *
+diff --git a/notxv6/ph.c b/notxv6/ph.c
+index 6df1500..bb0710b 100644
+--- a/notxv6/ph.c
++++ b/notxv6/ph.c
+@@ -13,7 +13,13 @@ struct entry {
+   int value;
+   struct entry *next;
+ };
+-struct entry *table[NBUCKET];
++// struct entry *table[NBUCKET];
++
++struct bucket {
++  struct entry* head;
++  pthread_mutex_t lock;
++}table[NBUCKET];
++
+ int keys[NKEYS];
+ int nthread = 1;
+ 
+@@ -26,13 +32,13 @@ now()
+ }
+ 
+ static void 
+-insert(int key, int value, struct entry **p, struct entry *n)
++insert(int key, int value, struct bucket *n)
+ {
+   struct entry *e = malloc(sizeof(struct entry));
+   e->key = key;
+   e->value = value;
+-  e->next = n;
+-  *p = e;
++  e->next = n->head;
++  n->head = e;
+ }
+ 
+ static 
+@@ -42,7 +48,8 @@ void put(int key, int value)
+ 
+   // is the key already present?
+   struct entry *e = 0;
+-  for (e = table[i]; e != 0; e = e->next) {
++  pthread_mutex_lock(&table[i].lock);
++  for (e = table[i].head; e != 0; e = e->next) {
+     if (e->key == key)
+       break;
+   }
+@@ -51,8 +58,9 @@ void put(int key, int value)
+     e->value = value;
+   } else {
+     // the new is new.
+-    insert(key, value, &table[i], table[i]);
++    insert(key, value, &table[i]);
+   }
++  pthread_mutex_unlock(&table[i].lock);
+ }
+ 
+ static struct entry*
+@@ -62,7 +70,7 @@ get(int key)
+ 
+ 
+   struct entry *e = 0;
+-  for (e = table[i]; e != 0; e = e->next) {
++  for (e = table[i].head; e != 0; e = e->next) {
+     if (e->key == key) break;
+   }
+ 
+@@ -114,7 +122,9 @@ main(int argc, char *argv[])
+   for (int i = 0; i < NKEYS; i++) {
+     keys[i] = random();
+   }
+-
++  for (int i = 0; i < NBUCKET; ++i){
++    pthread_mutex_init(&table[i].lock, NULL);
++  }
+   //
+   // first the puts
+   //
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..e440e5c
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++3
+\ No newline at end of file
+diff --git a/user/uthread.c b/user/uthread.c
+index 8e46826..c9d5ce9 100644
+--- a/user/uthread.c
++++ b/user/uthread.c
+@@ -2,6 +2,26 @@
+ #include "kernel/stat.h"
+ #include "user/user.h"
+ 
++// Saved registers for user thread context switches.
++struct context {
++  uint64 ra;
++  uint64 sp;
++
++  // callee-saved
++  uint64 s0;
++  uint64 s1;
++  uint64 s2;
++  uint64 s3;
++  uint64 s4;
++  uint64 s5;
++  uint64 s6;
++  uint64 s7;
++  uint64 s8;
++  uint64 s9;
++  uint64 s10;
++  uint64 s11;
++};
++
+ /* Possible states of a thread: */
+ #define FREE        0x0
+ #define RUNNING     0x1
+@@ -14,7 +34,7 @@
+ struct thread {
+   char       stack[STACK_SIZE]; /* the thread's stack */
+   int        state;             /* FREE, RUNNING, RUNNABLE */
+-
++  struct context context;
+ };
+ struct thread all_thread[MAX_THREAD];
+ struct thread *current_thread;
+@@ -63,6 +83,7 @@ thread_schedule(void)
+      * Invoke thread_switch to switch from t to next_thread:
+      * thread_switch(??, ??);
+      */
++    thread_switch((uint64)&t->context, (uint64)&next_thread->context);
+   } else
+     next_thread = 0;
+ }
+@@ -76,7 +97,9 @@ thread_create(void (*func)())
+     if (t->state == FREE) break;
+   }
+   t->state = RUNNABLE;
+-  // YOUR CODE HERE
++  // when scheduler choose the thread, it's ra is the func and sp is the stack top.
++  t->context.ra = (uint64)func;
++  t->context.sp = (uint64)&t->stack[STACK_SIZE-1];
+ }
+ 
+ void 
+diff --git a/user/uthread_switch.S b/user/uthread_switch.S
+index 5defb12..848dfe3 100644
+--- a/user/uthread_switch.S
++++ b/user/uthread_switch.S
+@@ -8,4 +8,34 @@
+ 	.globl thread_switch
+ thread_switch:
+ 	/* YOUR CODE HERE */
++      sd ra, 0(a0)
++      sd sp, 8(a0)
++      sd s0, 16(a0)
++      sd s1, 24(a0)
++      sd s2, 32(a0)
++      sd s3, 40(a0)
++      sd s4, 48(a0)
++      sd s5, 56(a0)
++      sd s6, 64(a0)
++      sd s7, 72(a0)
++      sd s8, 80(a0)
++      sd s9, 88(a0)
++      sd s10, 96(a0)
++      sd s11, 104(a0)
++
++      ld ra, 0(a1)
++      ld sp, 8(a1)
++      ld s0, 16(a1)
++      ld s1, 24(a1)
++      ld s2, 32(a1)
++      ld s3, 40(a1)
++      ld s4, 48(a1)
++      ld s5, 56(a1)
++      ld s6, 64(a1)
++      ld s7, 72(a1)
++      ld s8, 80(a1)
++      ld s9, 88(a1)
++      ld s10, 96(a1)
++      ld s11, 104(a1)
++	
+ 	ret    /* return to ra */
