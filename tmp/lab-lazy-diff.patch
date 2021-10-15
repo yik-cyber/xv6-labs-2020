@@ -1,0 +1,180 @@
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..cc020e8 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -41,15 +41,27 @@ sys_wait(void)
+ uint64
+ sys_sbrk(void)
+ {
+-  int addr;
++  // int addr;
+   int n;
+ 
+   if(argint(0, &n) < 0)
+     return -1;
+-  addr = myproc()->sz;
+-  if(growproc(n) < 0)
+-    return -1;
+-  return addr;
++  
++  struct proc* p = myproc();
++  int old_size = p->sz;
++
++  if(n < 0){
++    if(old_size + n < 0){
++      return -1;
++    }
++    else{
++      uvmdealloc(p->pagetable, old_size, old_size + n);
++    }
++  }
++  p->sz += n;
++  // if(growproc(n) < 0)
++  //   return -1;
++  return old_size;
+ }
+ 
+ uint64
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..ec3ed36 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -50,7 +50,9 @@ usertrap(void)
+   // save user program counter.
+   p->trapframe->epc = r_sepc();
+   
+-  if(r_scause() == 8){
++  uint64 scause = r_scause();
++
++  if(scause == 8){
+     // system call
+ 
+     if(p->killed)
+@@ -67,12 +69,34 @@ usertrap(void)
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
++  } else if(scause == 13 || scause == 15){
++    uint64 va = r_stval();
++    if(va >= p->sz || va < p->trapframe->sp){
++      p->killed = 1;
++      goto kill_proc;
++    }
++    va = PGROUNDDOWN(va); // round va to the page boundary
++    char* mem;
++
++    if((mem = kalloc()) == 0){
++      // printf("no free memory.\n");
++      p->killed = 1;
++      goto kill_proc;
++    }
++
++    if(mappages(p->pagetable, va, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
++      kfree(mem);
++      p->killed = 1;
++    }
++
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+     p->killed = 1;
+   }
+ 
++  kill_proc:
++
+   if(p->killed)
+     exit(-1);
+ 
+diff --git a/kernel/vm.c b/kernel/vm.c
+index bccb405..ffbc989 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -5,6 +5,8 @@
+ #include "riscv.h"
+ #include "defs.h"
+ #include "fs.h"
++#include "spinlock.h"
++#include "proc.h"
+ 
+ /*
+  * the kernel's page table.
+@@ -96,15 +98,29 @@ walkaddr(pagetable_t pagetable, uint64 va)
+ {
+   pte_t *pte;
+   uint64 pa;
++  struct proc* p = myproc();
+ 
+   if(va >= MAXVA)
+     return 0;
+ 
+   pte = walk(pagetable, va, 0);
+-  if(pte == 0)
+-    return 0;
+-  if((*pte & PTE_V) == 0)
+-    return 0;
++  // if(pte == 0)
++  //   return 0;
++  if(pte == 0 || (*pte & PTE_V) == 0){
++    if(va >= p->sz || va < PGROUNDDOWN(p->trapframe->sp)){
++      return 0;
++    }
++    va = PGROUNDDOWN(va);
++    char* mem;
++    if((mem = kalloc()) == 0){
++      return 0;
++    }
++    memset(mem, 0, PGSIZE);
++    if(mappages(p->pagetable, va, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
++      kfree(mem);
++      return 0;
++    }
++  }
+   if((*pte & PTE_U) == 0)
+     return 0;
+   pa = PTE2PA(*pte);
+@@ -180,10 +196,14 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+     panic("uvmunmap: not aligned");
+ 
+   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+-    if((pte = walk(pagetable, a, 0)) == 0)
+-      panic("uvmunmap: walk");
+-    if((*pte & PTE_V) == 0)
+-      panic("uvmunmap: not mapped");
++    if((pte = walk(pagetable, a, 0)) == 0){
++      continue;
++      // panic("uvmunmap: walk");
++    }
++    if((*pte & PTE_V) == 0){
++      // panic("uvmunmap: not mapped");
++      continue;
++    }
+     if(PTE_FLAGS(*pte) == PTE_V)
+       panic("uvmunmap: not a leaf");
+     if(do_free){
+@@ -314,10 +334,14 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   char *mem;
+ 
+   for(i = 0; i < sz; i += PGSIZE){
+-    if((pte = walk(old, i, 0)) == 0)
+-      panic("uvmcopy: pte should exist");
+-    if((*pte & PTE_V) == 0)
+-      panic("uvmcopy: page not present");
++    if((pte = walk(old, i, 0)) == 0){
++      continue;
++      // panic("uvmcopy: pte should exist");
++    }
++    if((*pte & PTE_V) == 0){
++      continue;
++      // panic("uvmcopy: page not present");
++    }
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+     if((mem = kalloc()) == 0)
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..bf0d87a
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++4
+\ No newline at end of file
