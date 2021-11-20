@@ -61,11 +61,12 @@ kfree(void *pa)
 
   push_off();
   int cpu = cpuid();
+  pop_off();
   acquire(&kmem[cpu].lock);
   r->next = kmem[cpu].freelist;
   kmem[cpu].freelist = r;
   release(&kmem[cpu].lock);
-  pop_off();
+  // pop_off();
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -91,6 +92,7 @@ kalloc(void)
 
   push_off();
   int cpu = cpuid();
+  pop_off();
   acquire(&kmem[cpu].lock);
   r = kmem[cpu].freelist;
   if(r)
@@ -124,7 +126,7 @@ kalloc(void)
       break;
     }
   }
-  pop_off();
+  // pop_off();
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
