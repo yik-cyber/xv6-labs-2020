@@ -1,0 +1,330 @@
+diff --git a/kernel/bio.c b/kernel/bio.c
+index 60d91a6..50cbb8b 100644
+--- a/kernel/bio.c
++++ b/kernel/bio.c
+@@ -26,30 +26,38 @@
+ struct {
+   struct spinlock lock;
+   struct buf buf[NBUF];
++} bcache;
+ 
+-  // Linked list of all buffers, through prev/next.
+-  // Sorted by how recently the buffer was used.
+-  // head.next is most recent, head.prev is least.
++struct {
++  struct spinlock lock;
+   struct buf head;
+-} bcache;
++} bucket[NBUCKET];
++
+ 
+ void
+ binit(void)
+ {
+   struct buf *b;
++  int i;
+ 
++  // initialize cache block
+   initlock(&bcache.lock, "bcache");
++  for(i = 0; i < NBUCKET; ++i){
++    initlock(&bucket[i].lock, "bcache");
++    bucket[i].head.prev = bucket[i].head.next = &bucket[i].head;
++  }
+ 
+-  // Create linked list of buffers
+-  bcache.head.prev = &bcache.head;
+-  bcache.head.next = &bcache.head;
+-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
+-    b->next = bcache.head.next;
+-    b->prev = &bcache.head;
++  // printf("init.\n");
++  
++  // initialize buffer block and insert buffer into the bucket
++  for(i = 0, b = bcache.buf; b < bcache.buf + NBUF; ++b, i = (i+1) % NBUCKET){
+     initsleeplock(&b->lock, "buffer");
+-    bcache.head.next->prev = b;
+-    bcache.head.next = b;
++    b->next = bucket[i].head.next;
++    b->prev = &bucket[i].head;
++    bucket[i].head.next->prev = b;
++    bucket[i].head.next = b;
+   }
++
+ }
+ 
+ // Look through buffer cache for block on device dev.
+@@ -58,34 +66,79 @@ binit(void)
+ static struct buf*
+ bget(uint dev, uint blockno)
+ {
+-  struct buf *b;
+-
+-  acquire(&bcache.lock);
++  struct buf *b, *head;
+ 
+-  // Is the block already cached?
+-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
++  int i = blockno % NBUCKET;
++  
++  // if the buf has been cached
++  acquire(&bucket[i].lock);
++  head = &bucket[i].head;
++  for(b = head->next; b != head; b = b->next){
+     if(b->dev == dev && b->blockno == blockno){
+       b->refcnt++;
+-      release(&bcache.lock);
++      release(&bucket[i].lock);
+       acquiresleep(&b->lock);
+       return b;
+     }
+   }
+ 
+-  // Not cached.
+-  // Recycle the least recently used (LRU) unused buffer.
+-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
+-    if(b->refcnt == 0) {
+-      b->dev = dev;
+-      b->blockno = blockno;
+-      b->valid = 0;
+-      b->refcnt = 1;
+-      release(&bcache.lock);
+-      acquiresleep(&b->lock);
+-      return b;
++  // not cached
++  uint min_time_stamp = (uint)-1;
++  struct buf *replace = 0;
++  acquire(&bcache.lock); // take advantage of the lock to serialize eviction
++  for(b = head->next; b != head; b = b->next){
++    if(b->refcnt == 0){
++      if(b->time_stamp < min_time_stamp){
++        min_time_stamp = b->time_stamp;
++        replace = b;
++      }
++    }
++  }
++
++  if(replace)
++    goto find;
++
++  int rj = -1;
++  for(int j = 0; j < NBUCKET; ++j){
++    if(j == i)
++      continue;
++    struct buf *other_head = &bucket[j].head;
++    for(b = other_head->next; b != other_head; b = b->next){
++      if(b->refcnt == 0){
++        if(b->time_stamp < min_time_stamp){
++          min_time_stamp = b->time_stamp;
++          replace = b;
++          rj = j;
++        }
++      }
+     }
+   }
++
++  if(replace){
++    // get the replace buf out of origional bucket and then insert it into the new bucket
++    acquire(&bucket[rj].lock);
++    replace->prev->next = replace->next;
++    replace->next->prev = replace->prev;
++    release(&bucket[rj].lock);
++
++    replace->next = head->next;
++    replace->prev = head;
++    head->next = head->next->prev = replace;
++
++    goto find;
++  }
++
+   panic("bget: no buffers");
++
++  find:
++  release(&bcache.lock);
++  replace->dev = dev;
++  replace->blockno = blockno;
++  replace->valid = 0;
++  replace->refcnt = 1;
++  release(&bucket[i].lock);
++  acquiresleep(&replace->lock);
++  return replace;  
+ }
+ 
+ // Return a locked buf with the contents of the indicated block.
+@@ -121,33 +174,38 @@ brelse(struct buf *b)
+ 
+   releasesleep(&b->lock);
+ 
+-  acquire(&bcache.lock);
++  int i = b->blockno % NBUCKET;
++
++  acquire(&bucket[i].lock);
+   b->refcnt--;
+   if (b->refcnt == 0) {
+     // no one is waiting for it.
+-    b->next->prev = b->prev;
+     b->prev->next = b->next;
+-    b->next = bcache.head.next;
+-    b->prev = &bcache.head;
+-    bcache.head.next->prev = b;
+-    bcache.head.next = b;
++    b->next->prev = b->prev;
++
++    b->next = bucket[i].head.next;
++    b->prev = &bucket[i].head;
++
++    b->next->prev = b->prev->next = b;
+   }
+   
+-  release(&bcache.lock);
++  release(&bucket[i].lock);
+ }
+ 
+ void
+ bpin(struct buf *b) {
+-  acquire(&bcache.lock);
++  int i = b->blockno % NBUCKET;
++  acquire(&bucket[i].lock);
+   b->refcnt++;
+-  release(&bcache.lock);
++  release(&bucket[i].lock);
+ }
+ 
+ void
+ bunpin(struct buf *b) {
+-  acquire(&bcache.lock);
++  int i = b->blockno % NBUCKET;
++  acquire(&bucket[i].lock);
+   b->refcnt--;
+-  release(&bcache.lock);
++  release(&bucket[i].lock);
+ }
+ 
+ 
+diff --git a/kernel/buf.h b/kernel/buf.h
+index 4616e9e..c9aedf9 100644
+--- a/kernel/buf.h
++++ b/kernel/buf.h
+@@ -3,6 +3,7 @@ struct buf {
+   int disk;    // does disk "own" buf?
+   uint dev;
+   uint blockno;
++  uint time_stamp;
+   struct sleeplock lock;
+   uint refcnt;
+   struct buf *prev; // LRU cache list
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..8633e07 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -21,12 +21,15 @@ struct run {
+ struct {
+   struct spinlock lock;
+   struct run *freelist;
+-} kmem;
++} kmem[NCPU];
+ 
+ void
+ kinit()
+ {
+-  initlock(&kmem.lock, "kmem");
++  for(int i = 0; i < NCPU; ++i){
++    initlock(&kmem[i].lock, "kmem");
++  }
++  // initlock(&kmem.lock, "kmem");
+   freerange(end, (void*)PHYSTOP);
+ }
+ 
+@@ -56,25 +59,72 @@ kfree(void *pa)
+ 
+   r = (struct run*)pa;
+ 
+-  acquire(&kmem.lock);
+-  r->next = kmem.freelist;
+-  kmem.freelist = r;
+-  release(&kmem.lock);
++  push_off();
++  int cpu = cpuid();
++  acquire(&kmem[cpu].lock);
++  r->next = kmem[cpu].freelist;
++  kmem[cpu].freelist = r;
++  release(&kmem[cpu].lock);
++  pop_off();
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+ // Returns a pointer that the kernel can use.
+ // Returns 0 if the memory cannot be allocated.
++struct run* middle_run(struct run* r){
++  struct run *q, *p, *fp;
++  q = 0;
++  p = fp = r;
++  while(fp->next && fp->next->next){
++    fp = fp->next->next;
++    q = p;
++    p = p->next;
++  }
++  
++  return q;
++}
++
+ void *
+ kalloc(void)
+ {
+   struct run *r;
+ 
+-  acquire(&kmem.lock);
+-  r = kmem.freelist;
++  push_off();
++  int cpu = cpuid();
++  acquire(&kmem[cpu].lock);
++  r = kmem[cpu].freelist;
+   if(r)
+-    kmem.freelist = r->next;
+-  release(&kmem.lock);
++    kmem[cpu].freelist = r->next;
++  release(&kmem[cpu].lock);
++
++  if(!r){
++    struct run *q;
++    for(int i = 0; i < NCPU; ++i){
++      if(i == cpu)
++        continue;
++      acquire(&kmem[i].lock);
++      if(!kmem[i].freelist){
++        release(&kmem[i].lock);
++        continue;
++      }
++      q = middle_run(kmem[i].freelist);
++      if(q){
++        r = q->next;
++        acquire(&kmem[cpu].lock);
++        kmem[cpu].freelist = r->next;
++        release(&kmem[cpu].lock);
++        q->next = 0;
++      }
++      else{
++        // page <= 2
++        r = kmem[i].freelist;
++        kmem[i].freelist = r->next;
++      }
++      release(&kmem[i].lock);
++      break;
++    }
++  }
++  pop_off();
+ 
+   if(r)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+diff --git a/kernel/param.h b/kernel/param.h
+index bb80c76..aaed210 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -8,6 +8,7 @@
+ #define MAXARG       32  // max exec arguments
+ #define MAXOPBLOCKS  10  // max # of blocks any FS op writes
+ #define LOGSIZE      (MAXOPBLOCKS*3)  // max data blocks in on-disk log
+-#define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
++#define NBUCKET      13
++#define NBUF         (NBUCKET*3)  // size of disk block cache
+ #define FSSIZE       10000  // size of file system in blocks
+ #define MAXPATH      128   // maximum file path name
